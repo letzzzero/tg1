@@ -22,21 +22,13 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
-DB_PATH = "dating_bot.db"
+DB_PATH = os.getenv("DB_PATH", "dating_bot.db")
+
 db_lock = asyncio.Lock()
 router = Router()
 
-GENDER_RU = {
-    "male": "Парень",
-    "female": "Девушка",
-    "other": "Другое",
-}
-TARGET_GENDER_RU = {
-    "any": "Любой",
-    "male": "Парень",
-    "female": "Девушка",
-    "other": "Другое",
-}
+GENDER_RU = {"male": "Парень", "female": "Девушка", "other": "Другое"}
+TARGET_GENDER_RU = {"any": "Любой", "male": "Парень", "female": "Девушка", "other": "Другое"}
 
 BTN_ONLINE = "🟢 Онлайн"
 BTN_OFFLINE = "🔴 Оффлайн"
@@ -50,17 +42,8 @@ BTN_DISCONNECT = "⛔ Разорвать связь"
 BTN_NEXT = "⏭ Следующий"
 BTN_REPORT = "🚨 Жалоба + разрыв"
 
-REG_GENDER_BTNS = {
-    "👨 Парень": "male",
-    "👩 Девушка": "female",
-    "🧩 Другое": "other",
-}
-TARGET_GENDER_BTNS = {
-    "🙋 Любой": "any",
-    "👨 Парень": "male",
-    "👩 Девушка": "female",
-    "🧩 Другое": "other",
-}
+REG_GENDER_BTNS = {"👨 Парень": "male", "👩 Девушка": "female", "🧩 Другое": "other"}
+TARGET_GENDER_BTNS = {"🙋 Любой": "any", "👨 Парень": "male", "👩 Девушка": "female", "🧩 Другое": "other"}
 
 
 class RegistrationSG(StatesGroup):
@@ -135,6 +118,8 @@ def report_reason_kb() -> InlineKeyboardMarkup:
         ]
     )
 
+
+# ---------------- DB ----------------
 
 async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -265,6 +250,27 @@ def format_partner_profile(u: dict) -> str:
     )
 
 
+# ---------------- Matching ----------------
+
+async def add_to_queue(user_id: int) -> None:
+    await db_execute(
+        "INSERT INTO queue (user_id, joined_at) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET joined_at=excluded.joined_at",
+        (user_id, utc_now()),
+    )
+
+
+async def remove_from_queue(user_id: int) -> None:
+    await db_execute("DELETE FROM queue WHERE user_id = ?", (user_id,))
+
+
+async def set_online_status(user_id: int, online: bool) -> None:
+    await db_execute(
+        "UPDATE users SET is_online=?, updated_at=? WHERE user_id=?",
+        (1 if online else 0, utc_now(), user_id),
+    )
+
+
 def compatible(a: dict, b: dict) -> bool:
     if not profile_ready(a) or not profile_ready(b):
         return False
@@ -288,65 +294,6 @@ def compatible(a: dict, b: dict) -> bool:
         return False
 
     return True
-
-
-async def add_to_queue(user_id: int) -> None:
-    await db_execute(
-        "INSERT INTO queue (user_id, joined_at) VALUES (?, ?) "
-        "ON CONFLICT(user_id) DO UPDATE SET joined_at=excluded.joined_at",
-        (user_id, utc_now()),
-    )
-
-
-async def remove_from_queue(user_id: int) -> None:
-    await db_execute("DELETE FROM queue WHERE user_id = ?", (user_id,))
-
-
-async def set_online_status(user_id: int, online: bool) -> None:
-    await db_execute(
-        "UPDATE users SET is_online=?, updated_at=? WHERE user_id=?",
-        (1 if online else 0, utc_now(), user_id),
-    )
-
-
-async def clear_pair_for(user_id: int) -> Optional[int]:
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT in_chat_with FROM users WHERE user_id=?", (user_id,))
-            row = await cur.fetchone()
-            await cur.close()
-
-            if not row or row["in_chat_with"] is None:
-                return None
-
-            partner_id = int(row["in_chat_with"])
-            now = utc_now()
-            await db.execute(
-                "UPDATE users SET in_chat_with=NULL, updated_at=? WHERE user_id IN (?, ?)",
-                (now, user_id, partner_id),
-            )
-            await db.execute("DELETE FROM queue WHERE user_id IN (?, ?)", (user_id, partner_id))
-            await db.commit()
-            return partner_id
-
-
-async def save_report_and_block(from_user_id: int, against_user_id: int, reason: str) -> None:
-    now = utc_now()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO reports (from_user_id, against_user_id, reason, created_at) VALUES (?, ?, ?, ?)",
-            (from_user_id, against_user_id, reason, now),
-        )
-        await db.execute(
-            "INSERT OR IGNORE INTO blocks (user_id, blocked_user_id, created_at) VALUES (?, ?, ?)",
-            (from_user_id, against_user_id, now),
-        )
-        await db.execute(
-            "INSERT OR IGNORE INTO blocks (user_id, blocked_user_id, created_at) VALUES (?, ?, ?)",
-            (against_user_id, from_user_id, now),
-        )
-        await db.commit()
 
 
 async def try_match(user_id: int) -> Optional[int]:
@@ -380,7 +327,7 @@ async def try_match(user_id: int) -> Optional[int]:
             await cur.close()
 
             for cand_id in candidate_ids:
-                # check blocks
+                # blocks
                 c = await db.execute(
                     "SELECT 1 FROM blocks WHERE (user_id=? AND blocked_user_id=?) OR (user_id=? AND blocked_user_id=?)",
                     (user_id, cand_id, cand_id, user_id),
@@ -434,32 +381,89 @@ async def start_search(bot: Bot, user_id: int) -> tuple[bool, Optional[int], str
     return True, None, "Ты в очереди. Ищу собеседника... 🔎"
 
 
+# ---------------- Chat end logic (FIXED) ----------------
+
+async def end_chat_for(user_id: int, *, offline_me: bool, offline_partner: bool) -> Optional[int]:
+    """
+    Разрывает связь user_id <-> partner_id.
+    Может переключать в оффлайн отдельно пользователя и партнёра.
+    Возвращает partner_id или None.
+    """
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+
+            cur = await db.execute("SELECT in_chat_with FROM users WHERE user_id=?", (user_id,))
+            row = await cur.fetchone()
+            await cur.close()
+
+            if not row or row["in_chat_with"] is None:
+                return None
+
+            partner_id = int(row["in_chat_with"])
+            now = utc_now()
+
+            # разрываем связь
+            await db.execute(
+                "UPDATE users SET in_chat_with=NULL, updated_at=? WHERE user_id IN (?, ?)",
+                (now, user_id, partner_id),
+            )
+            # удаляем из очереди (на всякий)
+            await db.execute("DELETE FROM queue WHERE user_id IN (?, ?)", (user_id, partner_id))
+
+            # оффлайн статусы
+            if offline_me and offline_partner:
+                await db.execute(
+                    "UPDATE users SET is_online=0, updated_at=? WHERE user_id IN (?, ?)",
+                    (now, user_id, partner_id),
+                )
+            elif offline_me:
+                await db.execute("UPDATE users SET is_online=0, updated_at=? WHERE user_id=?", (now, user_id))
+            elif offline_partner:
+                await db.execute("UPDATE users SET is_online=0, updated_at=? WHERE user_id=?", (now, partner_id))
+
+            await db.commit()
+            return partner_id
+
+
 async def go_offline(bot: Bot, user_id: int) -> None:
-    partner_id = await clear_pair_for(user_id)
+    """
+    Кнопка 🔴 Оффлайн: выключаем поиск у себя.
+    Если был чат — разрываем его, но партнёра НЕ заставляем уходить в оффлайн.
+    """
+    partner_id = await end_chat_for(user_id, offline_me=True, offline_partner=False)
     await remove_from_queue(user_id)
     await set_online_status(user_id, False)
 
     if partner_id:
         partner = await get_user(partner_id)
         if partner:
-            await bot.send_message(
-                partner_id,
-                "Собеседник завершил чат. Нажми «Онлайн», чтобы найти нового.",
-                reply_markup=main_menu_kb(bool(partner.get("is_online"))),
-            )
+            try:
+                await bot.send_message(
+                    partner_id,
+                    "Собеседник завершил чат. Нажми «Онлайн», чтобы найти нового.",
+                    reply_markup=main_menu_kb(bool(partner.get("is_online"))),
+                )
+            except Exception:
+                pass
 
 
-async def disconnect_chat(bot: Bot, user_id: int, notify_partner: str) -> Optional[int]:
-    partner_id = await clear_pair_for(user_id)
-    if partner_id:
-        partner = await get_user(partner_id)
-        if partner:
-            await bot.send_message(
-                partner_id,
-                f"{notify_partner}\nНажми «Онлайн», чтобы найти нового.",
-                reply_markup=main_menu_kb(bool(partner.get("is_online"))),
-            )
-    return partner_id
+async def save_report_and_block(from_user_id: int, against_user_id: int, reason: str) -> None:
+    now = utc_now()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO reports (from_user_id, against_user_id, reason, created_at) VALUES (?, ?, ?, ?)",
+            (from_user_id, against_user_id, reason, now),
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO blocks (user_id, blocked_user_id, created_at) VALUES (?, ?, ?)",
+            (from_user_id, against_user_id, now),
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO blocks (user_id, blocked_user_id, created_at) VALUES (?, ?, ?)",
+            (against_user_id, from_user_id, now),
+        )
+        await db.commit()
 
 
 async def show_profile(message: Message) -> None:
@@ -490,7 +494,7 @@ async def start_filters_flow(message: Message, state: FSMContext) -> None:
     await message.answer("Кого показывать в поиске?", reply_markup=target_gender_kb())
 
 
-# ---------- START / HELP ----------
+# ---------------- START / HELP ----------------
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -527,7 +531,7 @@ async def cmd_help(message: Message):
     )
 
 
-# ---------- PROFILE / FILTERS ----------
+# ---------------- PROFILE / FILTERS ----------------
 
 @router.message(Command("profile"))
 @router.message(F.text == BTN_PROFILE)
@@ -557,7 +561,7 @@ async def cmd_filters(message: Message, state: FSMContext):
     await start_filters_flow(message, state)
 
 
-# ---------- ONLINE / OFFLINE / CHAT CONTROL ----------
+# ---------------- ONLINE / OFFLINE / CHAT CONTROL ----------------
 
 @router.message(Command("online"))
 @router.message(F.text == BTN_ONLINE)
@@ -571,7 +575,6 @@ async def cmd_online(message: Message):
         return
 
     if partner_id:
-        # Сообщение о мэтче уже отправлено в start_search()
         return
 
     await message.answer(text, reply_markup=main_menu_kb(True))
@@ -589,41 +592,53 @@ async def cmd_offline(message: Message):
 @router.message(F.text == BTN_DISCONNECT)
 async def cmd_stop(message: Message):
     await ensure_user_row(message)
-    partner_id = await disconnect_chat(
-        message.bot,
-        message.from_user.id,
-        notify_partner="Собеседник завершил чат.",
-    )
-    u = await get_user(message.from_user.id)
-    await message.answer(
-        "Чат завершён." if partner_id else "Сейчас ты не в чате.",
-        reply_markup=main_menu_kb(bool(u.get("is_online")) if u else False),
-    )
+
+    partner_id = await end_chat_for(message.from_user.id, offline_me=True, offline_partner=True)
+
+    if partner_id:
+        try:
+            await message.bot.send_message(
+                partner_id,
+                "Собеседник завершил чат. Вы теперь оффлайн. Нажми «Онлайн», чтобы найти нового.",
+                reply_markup=main_menu_kb(False),
+            )
+        except Exception:
+            pass
+
+    await message.answer("Чат завершён. Ты теперь оффлайн.", reply_markup=main_menu_kb(False))
 
 
 @router.message(Command("next"))
 @router.message(F.text == BTN_NEXT)
 async def cmd_next(message: Message):
     await ensure_user_row(message)
-    await disconnect_chat(
-        message.bot,
-        message.from_user.id,
-        notify_partner="Собеседник переключился на следующего.",
-    )
-    ok, partner_id, text = await start_search(message.bot, message.from_user.id)
+
+    partner_id = await end_chat_for(message.from_user.id, offline_me=False, offline_partner=True)
+
+    if partner_id:
+        try:
+            await message.bot.send_message(
+                partner_id,
+                "Собеседник переключился на следующего. Ты теперь оффлайн. Нажми «Онлайн», чтобы найти нового.",
+                reply_markup=main_menu_kb(False),
+            )
+        except Exception:
+            pass
+
+    ok, new_partner_id, text = await start_search(message.bot, message.from_user.id)
 
     if not ok:
         u = await get_user(message.from_user.id)
         await message.answer(text, reply_markup=main_menu_kb(bool(u.get("is_online")) if u else False))
         return
 
-    if partner_id:
+    if new_partner_id:
         return
 
     await message.answer(text, reply_markup=main_menu_kb(True))
 
 
-# ---------- REPORT ----------
+# ---------------- REPORT ----------------
 
 @router.message(F.text == BTN_REPORT)
 async def btn_report(message: Message):
@@ -651,14 +666,24 @@ async def report_callback(callback: CallbackQuery):
 
     partner_id = int(me["in_chat_with"])
     await save_report_and_block(callback.from_user.id, partner_id, action)
-    await disconnect_chat(callback.bot, callback.from_user.id, notify_partner="Диалог завершён.")
 
-    u = await get_user(callback.from_user.id)
+    ended_partner = await end_chat_for(callback.from_user.id, offline_me=True, offline_partner=True)
+
+    if ended_partner:
+        try:
+            await callback.bot.send_message(
+                ended_partner,
+                "Диалог завершён по жалобе. Ты теперь оффлайн. Нажми «Онлайн», чтобы найти нового.",
+                reply_markup=main_menu_kb(False),
+            )
+        except Exception:
+            pass
+
     await callback.message.edit_text("Жалоба отправлена. Этот пользователь больше не попадётся тебе в поиске.")
-    await callback.message.answer("Чат завершён.", reply_markup=main_menu_kb(bool(u.get("is_online")) if u else False))
+    await callback.message.answer("Чат завершён. Ты теперь оффлайн.", reply_markup=main_menu_kb(False))
 
 
-# ---------- CANCEL ----------
+# ---------------- CANCEL ----------------
 
 @router.message(Command("cancel"))
 @router.message(F.text == BTN_CANCEL)
@@ -676,7 +701,7 @@ async def cancel_any(message: Message, state: FSMContext):
     )
 
 
-# ---------- REGISTRATION FSM ----------
+# ---------------- REGISTRATION FSM ----------------
 
 @router.message(RegistrationSG.gender)
 async def reg_gender(message: Message, state: FSMContext):
@@ -758,7 +783,7 @@ async def reg_bio(message: Message, state: FSMContext):
     await show_profile(message)
 
 
-# ---------- FILTERS FSM ----------
+# ---------------- FILTERS FSM ----------------
 
 @router.message(FiltersSG.gender)
 async def filters_gender(message: Message, state: FSMContext):
@@ -833,7 +858,7 @@ async def filters_age_max(message: Message, state: FSMContext):
     )
 
 
-# ---------- RELAY / FALLBACK ----------
+# ---------------- RELAY / FALLBACK ----------------
 
 @router.message()
 async def relay_or_fallback(message: Message, state: FSMContext):
@@ -875,7 +900,7 @@ async def relay_or_fallback(message: Message, state: FSMContext):
         await message.answer("Ошибка пересылки сообщения. Попробуй ещё раз.")
 
 
-# ---------- STARTUP ----------
+# ---------------- Polling runner (optional) ----------------
 
 async def on_startup(bot: Bot) -> None:
     await bot.set_my_commands(
@@ -893,13 +918,13 @@ async def on_startup(bot: Bot) -> None:
     )
 
 
-async def main():
+async def main_polling():
     logging.basicConfig(level=logging.INFO)
     load_dotenv()
 
     token = os.getenv("BOT_TOKEN")
     if not token:
-        raise RuntimeError("Укажи BOT_TOKEN в .env")
+        raise RuntimeError("Укажи BOT_TOKEN в .env или env переменной")
 
     await init_db()
 
@@ -912,4 +937,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main_polling())
